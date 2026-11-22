@@ -1,0 +1,99 @@
+# Dependencies
+**/node_modules/
+.pnp
+.pnp.js
+
+# Testing
+coverage/
+
+# Next.js
+.next/
+out/
+build/
+dist/
+.vercel/
+*.tsbuildinfo
+
+# Misc
+.DS_Store
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials/
+private-storage/
+
+# Debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local env files
+.env
+.env.*
+!.env.example
+
+# Python
+**/.venv/
+**/venv/
+__pycache__/
+*.py[cod]
+
+# Local data, uploads, generated media, and downloaded models
+model_cache/
+uploads/
+storage/
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.bson
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+*.m4v
+*.mpeg
+*.mpg
+*.wmv
+*.flv
+*.wav
+*.mp3
+*.safetensors
+*.onnx
+*.nara
+*.pt
+*.pth
+*.ckpt
+
+# TypeScript
+next-env.d.ts
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Docker
+docker-compose.override.yml
+
+# Logs
+logs/
+*.log
+
+# Prisma
+prisma/migrations/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# OS
+Thumbs.db
+ehthumbs.db
+Desktop.ini

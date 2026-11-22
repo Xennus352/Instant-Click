@@ -1,0 +1,344 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ============================================================
+  # LINT & TYPE CHECK
+  # ============================================================
+  lint-and-typecheck:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: services/nextjs/package-lock.json
+
+      - name: Install Next.js dependencies
+        working-directory: ./services/nextjs
+        run: npm ci
+
+      - name: Run ESLint
+        working-directory: ./services/nextjs
+        run: npm run lint
+
+      - name: Run TypeScript check
+        working-directory: ./services/nextjs
+        run: npm run type-check
+
+      - name: Run Prettier check
+        working-directory: ./services/nextjs
+        run: npx prettier --check .
+
+  # ============================================================
+  # UNIT TESTS
+  # ============================================================
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: services/nextjs/package-lock.json
+
+      - name: Install Next.js dependencies
+        working-directory: ./services/nextjs
+        run: npm ci
+
+      - name: Run tests
+        working-directory: ./services/nextjs
+        run: npm run test:coverage
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          directory: ./services/nextjs/coverage
+          fail_ci_if_error: true
+
+  # ============================================================
+  # PRISMA VALIDATION
+  # ============================================================
+  prisma-validation:
+    name: Prisma Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: services/nextjs/package-lock.json
+
+      - name: Install Next.js dependencies
+        working-directory: ./services/nextjs
+        run: npm ci
+
+      - name: Generate Prisma Client
+        working-directory: ./services/nextjs
+        run: npm run prisma:generate
+
+      - name: Validate Prisma Schema
+        working-directory: ./services/nextjs
+        run: npx prisma validate
+
+  # ============================================================
+  # DOCKER BUILD (DEV)
+  # ============================================================
+  docker-build-dev:
+    name: Docker Build (Dev)
+    runs-on: ubuntu-latest
+    needs: [lint-and-typecheck, unit-tests, prisma-validation]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build development images
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.dev.yml build \
+            --build-arg BUILDKIT_INLINE_CACHE=1
+
+      - name: Test docker compose up
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+          sleep 30
+          docker compose -f docker-compose.yml -f docker-compose.dev.yml ps
+
+      - name: Run health checks
+        run: |
+          chmod +x scripts/healthcheck.sh
+          ./scripts/healthcheck.sh all
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.dev.yml down -v
+
+  # ============================================================
+  # DOCKER BUILD (PROD)
+  # ============================================================
+  docker-build-prod:
+    name: Docker Build (Prod)
+    runs-on: ubuntu-latest
+    needs: [lint-and-typecheck, unit-tests, prisma-validation]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Next.js
+        id: meta-nextjs
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/nextjs
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Next.js
+        uses: docker/build-push-action@v5
+        with:
+          context: ./services/nextjs
+          file: ./services/nextjs/Dockerfile
+          push: true
+          tags: ${{ steps.meta-nextjs.outputs.tags }}
+          labels: ${{ steps.meta-nextjs.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Extract metadata for ASR Worker
+        id: meta-asr
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/asr-worker
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=
+
+      - name: Build and push ASR Worker
+        uses: docker/build-push-action@v5
+        with:
+          context: ./services/asr-worker
+          file: ./services/asr-worker/Dockerfile
+          push: true
+          tags: ${{ steps.meta-asr.outputs.tags }}
+          labels: ${{ steps.meta-asr.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Extract metadata for TTS Worker
+        id: meta-tts
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/tts-worker
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=
+
+      - name: Build and push TTS Worker
+        uses: docker/build-push-action@v5
+        with:
+          context: ./services/tts-worker
+          file: ./services/tts-worker/Dockerfile
+          push: true
+          tags: ${{ steps.meta-tts.outputs.tags }}
+          labels: ${{ steps.meta-tts.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Extract metadata for AI Worker
+        id: meta-ai
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/ai-worker
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=
+
+      - name: Build and push AI Worker
+        uses: docker/build-push-action@v5
+        with:
+          context: ./services/ai-worker
+          file: ./services/ai-worker/Dockerfile
+          push: true
+          tags: ${{ steps.meta-ai.outputs.tags }}
+          labels: ${{ steps.meta-ai.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Extract metadata for Render Worker
+        id: meta-render
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/render-worker
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=
+
+      - name: Build and push Render Worker
+        uses: docker/build-push-action@v5
+        with:
+          context: ./services/render-worker
+          file: ./services/render-worker/Dockerfile
+          push: true
+          tags: ${{ steps.meta-render.outputs.tags }}
+          labels: ${{ steps.meta-render.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ============================================================
+  # SECURITY SCANNING
+  # ============================================================
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: [docker-build-dev]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run Trivy on Docker images (dev)
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.dev.yml build
+          trivy image --severity HIGH,CRITICAL instantcap-nextjs:dev
+          trivy image --severity HIGH,CRITICAL instantcap-asr-worker:dev
+          trivy image --severity HIGH,CRITICAL instantcap-tts-worker:dev
+          trivy image --severity HIGH,CRITICAL instantcap-ai-worker:dev
+          trivy image --severity HIGH,CRITICAL instantcap-render-worker:dev
+
+  # ============================================================
+  # DEPLOY STAGING
+  # ============================================================
+  deploy-staging:
+    name: Deploy Staging
+    runs-on: ubuntu-latest
+    needs: [docker-build-prod, security-scan]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to staging
+        run: |
+          echo "Deploy to staging environment"
+          # Add your staging deployment commands here
+          # Example: kubectl apply -f k8s/staging/
+          # Or: docker compose -f docker-compose.yml -f docker-compose.staging.yml up -d
+
+  # ============================================================
+  # NOTIFICATIONS
+  # ============================================================
+  notify:
+    name: Notify
+    runs-on: ubuntu-latest
+    needs: [lint-and-typecheck, unit-tests, prisma-validation, docker-build-dev, security-scan]
+    if: always()
+    steps:
+      - name: Determine status
+        id: status
+        run: |
+          if [[ "${{ needs.lint-and-typecheck.result }}" == "success" && \
+                "${{ needs.unit-tests.result }}" == "success" && \
+                "${{ needs.prisma-validation.result }}" == "success" && \
+                "${{ needs.docker-build-dev.result }}" == "success" && \
+                "${{ needs.security-scan.result }}" == "success" ]]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send notification
+        run: |
+          echo "Build ${{ steps.status.outputs.status }} for ${{ github.repository }}@${{ github.sha }}"
+          # Add Slack/Discord/Email notification here

@@ -1,0 +1,34 @@
+# ASR Worker Development Dockerfile
+# Runs FastAPI app with model availability detection
+
+FROM python:3.11-slim
+
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    wget \
+    curl \
+    dumb-init \
+    libsndfile1 \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Create non-root user
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY app.py .
+
+USER appuser
+
+EXPOSE 8001
+
+ENTRYPOINT ["dumb-init", "--"]
+
+# Run FastAPI app with model availability detection
+CMD ["python", "app.py"]

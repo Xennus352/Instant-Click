@@ -1,0 +1,1329 @@
+// Prisma Schema for InstantCap
+// MongoDB database with Prisma ORM
+// This is a starting schema - DataCore will refine per their analysis
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// USER & AUTHENTICATION
+// ============================================================
+enum Role {
+  USER
+  ADMIN
+  SUPER_ADMIN
+  SUPPORT
+  FINANCE
+}
+
+// Nullable only for legacy documents. Authorization fails closed unless ACTIVE;
+// backfill null/missing values before deploying that gate.
+enum AccountStatus {
+  ACTIVE
+  SUSPENDED
+  BANNED
+}
+
+model User {
+  id            String    @id @default(auto()) @map("_id") @db.ObjectId
+  email         String    @unique
+  emailVerified Boolean   @default(false)
+  name          String
+  image         String?
+  role          Role      @default(USER)
+  accountStatus AccountStatus?
+  // Legacy shadow balance. CreditWallet.balance is the billing source of truth.
+  credits       Int       @default(0)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  accounts      Account[]
+  sessions      Session[]
+  projects      MovieProject[]
+  usageRecords  UsageRecord[]
+  transactions  Transaction[]
+  wallet        CreditWallet?
+  creditTransactions CreditTransaction[]
+  creditReservations CreditReservation[]
+  movieAssets   MovieAsset[]
+  uploadSessions MovieUploadSession[]
+  promotionalWallets PromoEntitlementWallet[]
+  promoReservations PromoReservation[]
+  creditQuotes CreditQuote[]
+  paymentOrders PaymentOrder[]
+  notifications Notification[]
+  notificationPreference NotificationPreference?
+  galleryEntries GalleryEntry[]
+  accountPreference UserPreference?
+
+  @@index([role])
+  @@index([accountStatus, createdAt])
+}
+
+model Account {
+  id                String  @id @default(auto()) @map("_id") @db.ObjectId
+  userId            String  @db.ObjectId
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.String
+  access_token      String? @db.String
+  expires_at        DateTime?
+  refresh_token_expires_at DateTime?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.String
+  session_state     String?
+  password          String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  sessionToken String   @unique
+  userId       String   @db.ObjectId
+  expires      DateTime
+  ipAddress    String?
+  userAgent    String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  identifier String
+  token      String   @unique
+  expires    DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+}
+
+// ============================================================
+// MOVIE PROJECTS
+// ============================================================
+model MovieProject {
+  id              String           @id @default(auto()) @map("_id") @db.ObjectId
+  userId          String           @db.ObjectId
+  title           String
+  originalTitle   String?
+  description     String?
+  status          ProjectStatus    @default(UPLOADED)
+  sourceVideoUrl  String
+  sourceVideoKey  String           // S3 key
+  duration        Float?           // seconds
+  fileSize        Int?             // bytes
+  mimeType        String?
+  creditsReserved Int              @default(0)
+  creditsUsed     Int              @default(0)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  completedAt     DateTime?
+
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  audioExtraction AudioExtraction?
+  transcription   Transcription?
+  analysis        MovieAnalysis?
+  recapScript     RecapScript?
+  narration       Narration?
+  subtitles       Subtitle[]
+  renders         VideoRender[]
+  assets          MovieAsset[]
+  uploadSessions  MovieUploadSession[]
+  jobRecords      JobRecord[]
+  galleryEntries  GalleryEntry[]
+  promoReservations PromoReservation[]
+  creditQuotes CreditQuote[]
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+enum ProjectStatus {
+  UPLOADED
+  AUDIO_EXTRACTING
+  AUDIO_EXTRACTED
+  TRANSCRIBING
+  TRANSCRIBED
+  ANALYZING
+  ANALYZED
+  SCRIPT_GENERATING
+  SCRIPT_GENERATED
+  NARRATING
+  NARRATED
+  SUBTITLING
+  SUBTITLED
+  RENDERING
+  RENDERED
+  COMPLETED
+  FAILED
+}
+
+enum MovieAssetStatus {
+  PENDING_UPLOAD
+  UPLOADING
+  VERIFYING
+  VERIFIED
+  QUARANTINED
+  PROCESSING
+  READY
+  FAILED
+  ABORTED
+}
+
+enum MovieAssetScanStatus {
+  NOT_CONFIGURED
+  PENDING
+  CLEAN
+  INFECTED
+  ERROR
+}
+
+enum MovieUploadSessionStatus {
+  CREATED
+  UPLOADING
+  COMPLETION_PENDING
+  VERIFIED
+  FAILED
+  ABORTED
+  EXPIRED
+}
+
+// VERIFIED requires size, checksum, and magic-byte checks. Keep assets quarantined until AV scanning is clean.
+model MovieAsset {
+  id             String           @id @default(auto()) @map("_id") @db.ObjectId
+  projectId      String           @db.ObjectId
+  ownerId        String           @db.ObjectId
+  bucket         String
+  storageKey     String
+  originalFilename String
+  mimeType       String?
+  sizeBytes      BigInt?
+  // Server-observed checksum; populate only after independently computing or verifying it.
+  checksum       String?
+  checksumAlgorithm String?
+  etag           String?
+  objectVersionId String?
+  sizeVerifiedAt DateTime?
+  checksumVerifiedAt DateTime?
+  signatureVerifiedAt DateTime?
+  detectedContainer String?
+  detectedMimeType String?
+  scanStatus     MovieAssetScanStatus @default(NOT_CONFIGURED)
+  quarantinedAt  DateTime?
+  durationSec    Float?
+  width          Int?
+  height         Int?
+  fps            Float?
+  probeMetadata  Json?
+  status         MovieAssetStatus @default(PENDING_UPLOAD)
+  verifiedAt     DateTime?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  project        MovieProject       @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  owner          User               @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  uploadSession  MovieUploadSession?
+
+  @@unique([bucket, storageKey], name: "bucket_storageKey")
+  @@index([ownerId, createdAt])
+  @@index([projectId, createdAt])
+  @@index([status, createdAt])
+}
+
+// Durable server-side upload intent; never store presigned URLs here.
+model MovieUploadSession {
+  id                  String                   @id @default(auto()) @map("_id") @db.ObjectId
+  assetId             String                   @unique @db.ObjectId
+  projectId           String                   @db.ObjectId
+  ownerId             String                   @db.ObjectId
+  idempotencyKey      String
+  expectedSizeBytes   BigInt
+  expectedContentType String
+  checksumAlgorithm   String?
+  expectedChecksum    String?
+  multipartUploadId   String?
+  status              MovieUploadSessionStatus @default(CREATED)
+  expiresAt           DateTime
+  presignedUrlExpiresAt DateTime?
+  completionRequestedAt DateTime?
+  verifiedAt          DateTime?
+  failureCode         String?
+  createdAt           DateTime                 @default(now())
+  updatedAt           DateTime                 @updatedAt
+
+  asset   MovieAsset   @relation(fields: [assetId], references: [id], onDelete: Restrict)
+  project MovieProject @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  owner   User         @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+
+  @@unique([ownerId, idempotencyKey], name: "ownerId_idempotencyKey")
+  @@index([status, expiresAt])
+  @@index([projectId, createdAt])
+}
+
+model AudioExtraction {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  projectId     String   @unique @db.ObjectId
+  // Source asset ObjectId; application must enforce project ownership and asset readiness.
+  assetId       String?  @db.ObjectId
+  audioUrl      String
+  audioKey      String   // S3 key
+  duration      Float    // seconds
+  format        String   @default("wav")
+  sampleRate    Int      @default(16000)
+  channels      Int      @default(1)
+  fileSize      Int
+  status        ExtractionStatus @default(PENDING)
+  errorMessage  String?
+  startedAt     DateTime?
+  completedAt   DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  project       MovieProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+  @@index([assetId])
+}
+
+enum ExtractionStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+// ============================================================
+// TRANSCRIPTION (ASR)
+// ============================================================
+model Transcription {
+  id              String            @id @default(auto()) @map("_id") @db.ObjectId
+  projectId       String            @unique @db.ObjectId
+  audioExtractionId String?          @db.ObjectId
+  segments        TranscriptSegment[]
+  fullText        String            @db.String
+  language        String            @default("my")
+  confidence      Float?
+  modelProvider   String?
+  modelVersion    String            @default("nara-sar-v1")
+  status          TranscriptionStatus @default(PENDING)
+  errorMessage    String?
+  startedAt       DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  project         MovieProject      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+  @@index([audioExtractionId])
+}
+
+model TranscriptSegment {
+  id          String  @id @default(auto()) @map("_id") @db.ObjectId
+  transcriptionId String @db.ObjectId
+  start       Float   // seconds
+  end         Float   // seconds
+  text        String
+  confidence  Float?
+  speaker     String?
+
+  transcription Transcription @relation(fields: [transcriptionId], references: [id], onDelete: Cascade)
+
+  @@index([transcriptionId])
+  @@index([start, end])
+  @@index([transcriptionId, start, end])
+}
+
+enum TranscriptionStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+// ============================================================
+// MOVIE ANALYSIS (AI Understanding)
+// ============================================================
+model MovieAnalysis {
+  id              String   @id @default(auto()) @map("_id") @db.ObjectId
+  projectId       String   @unique @db.ObjectId
+  transcriptionId String?  @db.ObjectId
+  genre           String[]
+  themes          String[]
+  characters      Character[]
+  plotSummary     String   @db.String
+  keyScenes       KeyScene[]
+  mood            String
+  tone            String
+  modelProvider   String   @default("gemini")
+  modelVersion    String
+  promptVersion   String?
+  status          AnalysisStatus @default(PENDING)
+  errorMessage    String?
+  startedAt       DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  project         MovieProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+  @@index([transcriptionId])
+}
+
+model Character {
+  id          String  @id @default(auto()) @map("_id") @db.ObjectId
+  analysisId  String  @db.ObjectId
+  name        String
+  description String?
+  screenTime  Float?  // percentage
+  importance  Int     @default(1) // 1-5
+
+  analysis    MovieAnalysis @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+}
+
+model KeyScene {
+  id          String  @id @default(auto()) @map("_id") @db.ObjectId
+  analysisId  String  @db.ObjectId
+  startTime   Float
+  endTime     Float
+  description String
+  importance  Int     @default(1) // 1-5
+
+  analysis    MovieAnalysis @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+}
+
+enum AnalysisStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+// ============================================================
+// RECAP SCRIPT
+// ============================================================
+model RecapScript {
+  id              String         @id @default(auto()) @map("_id") @db.ObjectId
+  projectId       String         @unique @db.ObjectId
+  analysisId      String?        @db.ObjectId
+  style           RecapStyle     @default(CINEMATIC)
+  targetLength    Int            @default(300) // seconds
+  language        String         @default("my")
+  content         String         @db.String
+  segments        ScriptSegment[]
+  version         Int            @default(1)
+  modelProvider   String?
+  modelVersion    String?
+  promptVersion   String?
+  status          ScriptStatus   @default(DRAFT)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  project         MovieProject   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+  @@index([analysisId])
+}
+
+model ScriptSegment {
+  id          String  @id @default(auto()) @map("_id") @db.ObjectId
+  scriptId    String  @db.ObjectId
+  order       Int
+  text        String
+  startTime   Float?  // target start in final video
+  endTime     Float?  // target end in final video
+  voiceId     String? // assigned voice
+  notes       String?
+
+  script      RecapScript @relation(fields: [scriptId], references: [id], onDelete: Cascade)
+
+  @@index([scriptId, order])
+}
+
+enum RecapStyle {
+  CINEMATIC
+  EMOTIONAL
+  STORYTELLING
+  SUSPENSE
+  DOCUMENTARY
+}
+
+enum ScriptStatus {
+  DRAFT
+  REVIEW
+  APPROVED
+  REGENERATING
+}
+
+// ============================================================
+// NARRATION (TTS)
+// ============================================================
+model Narration {
+  id              String           @id @default(auto()) @map("_id") @db.ObjectId
+  projectId       String           @unique @db.ObjectId
+  scriptId        String           @db.ObjectId
+  voicePreset     String           // voice ID from Nara Mini
+  segments        NarrationSegment[]
+  totalDuration   Float?
+  status          NarrationStatus  @default(PENDING)
+  errorMessage    String?
+  startedAt       DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  project         MovieProject     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+}
+
+model NarrationSegment {
+  id              String  @id @default(auto()) @map("_id") @db.ObjectId
+  narrationId     String  @db.ObjectId
+  scriptSegmentId String  @db.ObjectId
+  order           Int
+  text            String
+  audioUrl        String?
+  audioKey        String? // S3 key
+  duration        Float?
+  voiceId         String
+  status          SegmentStatus @default(PENDING)
+  errorMessage    String?
+  retryCount      Int     @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  narration       Narration @relation(fields: [narrationId], references: [id], onDelete: Cascade)
+
+  @@index([narrationId, order])
+  @@index([scriptSegmentId])
+}
+
+enum NarrationStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  PARTIAL
+}
+
+enum SegmentStatus {
+  PENDING
+  GENERATING
+  COMPLETED
+  FAILED
+  REGENERATING
+}
+
+// ============================================================
+// SUBTITLES
+// ============================================================
+model Subtitle {
+  id              String           @id @default(auto()) @map("_id") @db.ObjectId
+  projectId       String           @db.ObjectId
+  language        String           @default("my")
+  format          SubtitleFormat   @default(SRT)
+  content         String           @db.String
+  url             String?
+  key             String?          // S3 key
+  status          SubtitleStatus   @default(PENDING)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  project         MovieProject     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, language])
+  @@index([status])
+}
+
+enum SubtitleFormat {
+  SRT
+  VTT
+  ASS
+}
+
+enum SubtitleStatus {
+  PENDING
+  GENERATING
+  COMPLETED
+  FAILED
+}
+
+// ============================================================
+// VIDEO RENDERING
+// ============================================================
+model VideoRender {
+  id              String          @id @default(auto()) @map("_id") @db.ObjectId
+  projectId       String          @db.ObjectId
+  narrationId     String?         @db.ObjectId
+  subtitleId      String?         @db.ObjectId
+  outputUrl       String?
+  outputKey       String?         // S3 key
+  resolution      String          @default("1080p")
+  fps             Int             @default(30)
+  codec           String          @default("h264")
+  bitrate         String?
+  duration        Float?
+  fileSize        Int?
+  status          RenderStatus    @default(PENDING)
+  progress        Int             @default(0) // 0-100
+  errorMessage    String?
+  ffmpegCommand   String?         @db.String
+  startedAt       DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  project         MovieProject    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  galleryEntry    GalleryEntry?
+
+  @@index([projectId])
+  @@index([status])
+}
+
+enum RenderStatus {
+  PENDING
+  QUEUED
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+// ============================================================
+// VOICE PRESETS
+// ============================================================
+model VoicePreset {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  voiceId     String   @unique // e.g., "shoon", "thazin"
+  displayName String
+  language    String   @default("my")
+  gender      String?
+  description String?
+  sampleUrl   String?
+  isActive    Boolean  @default(true)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([isActive, sortOrder])
+}
+
+// ============================================================
+// BILLING & CREDITS
+// ============================================================
+model Transaction {
+  // Legacy billing history; new billing writes must use CreditTransaction.
+  id              String            @id @default(auto()) @map("_id") @db.ObjectId
+  userId          String            @db.ObjectId
+  type            TransactionType
+  amount          Int               // credits (positive = credit, negative = debit)
+  balanceBefore   Int
+  balanceAfter    Int
+  description     String
+  referenceId     String?           @db.ObjectId // projectId, etc.
+  referenceType   String?           // "project", "purchase", "refund", etc.
+  status          TransactionStatus @default(COMPLETED)
+  metadata        Json?
+  createdAt       DateTime          @default(now())
+
+  user            User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([referenceId, referenceType])
+  @@index([status])
+}
+
+enum TransactionType {
+  PURCHASE
+  USAGE
+  REFUND
+  BONUS
+  ADMIN_ADJUSTMENT
+  RESERVATION
+  RESERVATION_RELEASE
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REVERSED
+}
+
+enum CreditTransactionType {
+  GRANT
+  PURCHASE
+  RESERVE
+  CAPTURE
+  RELEASE
+  REFUND
+  ADJUSTMENT
+  EXPIRY
+}
+
+enum CreditTransactionStatus {
+  PENDING
+  POSTED
+  VOIDED
+}
+
+enum CreditReservationStatus {
+  OPEN
+  SETTLED
+}
+
+model CreditWallet {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String   @unique @db.ObjectId
+  // balance is settled credits; reserved is a held subset. Spendable = balance - reserved.
+  balance   Int      @default(0)
+  reserved  Int      @default(0)
+  version   Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user         User                @relation(fields: [userId], references: [id], onDelete: Restrict)
+  transactions CreditTransaction[]
+  reservations CreditReservation[]
+}
+
+model CreditReservation {
+  id              String                  @id @default(auto()) @map("_id") @db.ObjectId
+  walletId        String                  @db.ObjectId
+  userId          String                  @db.ObjectId
+  projectId       String?                 @db.ObjectId
+  jobId           String?                 @db.ObjectId
+  idempotencyKey  String
+  amount          Int
+  capturedAmount  Int                     @default(0)
+  releasedAmount  Int                     @default(0)
+  status          CreditReservationStatus @default(OPEN)
+  version         Int                     @default(0)
+  expiresAt       DateTime?
+  quoteId         String?                 @db.ObjectId
+  pricingSnapshot Json?
+  createdAt       DateTime                @default(now())
+  updatedAt       DateTime                @updatedAt
+
+  wallet       CreditWallet       @relation(fields: [walletId], references: [id], onDelete: Restrict)
+  user         User               @relation(fields: [userId], references: [id], onDelete: Restrict)
+  transactions CreditTransaction[]
+
+  @@unique([userId, idempotencyKey])
+  @@index([walletId, status, createdAt])
+  @@index([projectId, status, createdAt])
+  @@index([jobId, status, createdAt])
+  @@index([quoteId])
+}
+
+model CreditTransaction {
+  id             String                  @id @default(auto()) @map("_id") @db.ObjectId
+  walletId       String                  @db.ObjectId
+  userId         String                  @db.ObjectId
+  projectId      String?                 @db.ObjectId
+  jobId          String?                 @db.ObjectId
+  reservationId  String?                 @db.ObjectId
+  paymentOrderId String?                 @db.ObjectId
+  reversalOfId   String?                 @db.ObjectId
+  sourceRecordId String?
+  type           CreditTransactionType
+  // Append-only; corrections are compensating entries. Never update or delete posted entries.
+  // Signed settled-balance delta: reserve/release use 0; capture/debit use negative values.
+  amount         Int
+  reservedDelta  Int                     @default(0)
+  balanceAfter   Int
+  reservedAfter  Int
+  status         CreditTransactionStatus @default(POSTED)
+  idempotencyKey String                  @unique
+  reason         String?
+  metadata       Json?
+  createdAt      DateTime                @default(now())
+
+  wallet       CreditWallet  @relation(fields: [walletId], references: [id], onDelete: Restrict)
+  user         User          @relation(fields: [userId], references: [id], onDelete: Restrict)
+  reservation  CreditReservation? @relation(fields: [reservationId], references: [id], onDelete: Restrict)
+  paymentOrder PaymentOrder? @relation(fields: [paymentOrderId], references: [id], onDelete: Restrict)
+  reversalOf    CreditTransaction? @relation("CreditReversals", fields: [reversalOfId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reversals     CreditTransaction[] @relation("CreditReversals")
+  usageRecords UsageRecord[]
+
+  @@unique([userId, idempotencyKey], name: "userId_idempotencyKey")
+  @@index([userId, createdAt])
+  @@index([walletId, createdAt])
+  @@index([projectId, createdAt])
+  @@index([jobId, createdAt])
+  @@index([reservationId, createdAt])
+  @@index([paymentOrderId, createdAt])
+  @@index([reversalOfId, createdAt])
+  @@index([sourceRecordId])
+}
+
+model UsageRecord {
+  id            String      @id @default(auto()) @map("_id") @db.ObjectId
+  userId        String      @db.ObjectId
+  projectId     String?     @db.ObjectId
+  jobId         String?     @db.ObjectId
+  sourceRecordId String?
+  creditTransactionId String? @db.ObjectId
+  feature       UsageFeature
+  metric        String?
+  quantity      Float?
+  unit          String?
+  creditsUsed   Int
+  metadata      Json?
+  pricingSnapshot Json?
+  createdAt     DateTime    @default(now())
+
+  user          User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  creditTransaction CreditTransaction? @relation(fields: [creditTransactionId], references: [id], onDelete: Restrict)
+
+  @@index([userId, createdAt])
+  @@index([projectId, createdAt])
+  @@index([jobId, createdAt])
+  @@index([creditTransactionId])
+  @@index([sourceRecordId])
+  @@index([feature, createdAt])
+}
+
+enum UsageFeature {
+  AUDIO_EXTRACTION
+  TRANSCRIPTION
+  MOVIE_ANALYSIS
+  SCRIPT_GENERATION
+  NARRATION
+  SUBTITLE_GENERATION
+  VIDEO_RENDERING
+}
+
+// ============================================================
+// ADMIN CONFIGURATION
+// ============================================================
+model AdminConfig {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  key         String   @unique
+  value       Json
+  description String?
+  updatedAt   DateTime @updatedAt
+  updatedBy   String?  @db.ObjectId
+
+}
+
+// ============================================================
+// JOB PERSISTENCE (BullMQ job data)
+// ============================================================
+model JobRecord {
+  id            String       @id @default(auto()) @map("_id") @db.ObjectId
+  projectId     String?      @db.ObjectId
+  queueName     String
+  jobId         String       @unique
+  name          String
+  data          Json
+  opts          Json?
+  progress      Int          @default(0)
+  status        JobStatus    @default(WAITING)
+  returnValue   Json?
+  failedReason  String?
+  attemptsMade  Int          @default(0)
+  timestamp     DateTime     @default(now())
+  processedOn   DateTime?
+  finishedOn    DateTime?
+  runId         String?
+  stage         String?
+  leaseOwner    String?
+  leaseExpiresAt DateTime?
+  cancelRequestedAt DateTime?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  project       MovieProject? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  events        JobEvent[]
+  outboxRecords JobOutbox[]
+
+  @@index([queueName, status])
+  @@index([projectId, status, createdAt])
+  @@index([queueName, status, leaseExpiresAt])
+  @@index([timestamp])
+}
+
+enum JobStatus {
+  WAITING
+  ACTIVE
+  COMPLETED
+  FAILED
+  DELAYED
+  PAUSED
+}
+
+// Per-user, per-campaign promotional recap allowances. Counters are a cached balance;
+// PromoEntitlementEvent and reservations provide the reconciliation/audit trail.
+enum PromoReservationStatus {
+  OPEN
+  CAPTURED
+  RELEASED
+}
+
+enum PromoEventType {
+  GRANT
+  RESERVE
+  CAPTURE
+  RELEASE
+  ADJUSTMENT
+}
+
+model PromoCampaign {
+  id              String   @id @default(auto()) @map("_id") @db.ObjectId
+  key             String   @unique
+  enabled         Boolean  @default(false)
+  freeRecapCount  Int      @default(2)
+  startsAt        DateTime?
+  endsAt          DateTime?
+  eligibilityRules Json?
+  version         Int      @default(1)
+  createdBy       String?  @db.ObjectId
+  updatedBy       String?  @db.ObjectId
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  wallets         PromoEntitlementWallet[]
+  reservations    PromoReservation[]
+  events          PromoEntitlementEvent[]
+
+  @@index([enabled, startsAt, endsAt])
+}
+
+model PromoEntitlementWallet {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId      String   @db.ObjectId
+  campaignId  String   @db.ObjectId
+  granted     Int      @default(0)
+  reserved    Int      @default(0)
+  consumed    Int      @default(0)
+  version     Int      @default(0)
+  grantedAt   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Restrict)
+  campaign    PromoCampaign @relation(fields: [campaignId], references: [id], onDelete: Restrict)
+  reservations PromoReservation[]
+  events      PromoEntitlementEvent[]
+
+  @@unique([userId, campaignId])
+  @@index([campaignId, createdAt])
+}
+
+model PromoReservation {
+  id          String                @id @default(auto()) @map("_id") @db.ObjectId
+  walletId    String                @db.ObjectId
+  userId      String                @db.ObjectId
+  campaignId  String                @db.ObjectId
+  projectId   String                @db.ObjectId
+  // Stable logical generation/run ID, independent of stage-level BullMQ job IDs.
+  runId       String
+  idempotencyKey String
+  status      PromoReservationStatus @default(OPEN)
+  expiresAt   DateTime?
+  capturedAt  DateTime?
+  releasedAt  DateTime?
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+
+  wallet      PromoEntitlementWallet @relation(fields: [walletId], references: [id], onDelete: Restrict)
+  user        User                   @relation(fields: [userId], references: [id], onDelete: Restrict)
+  project     MovieProject           @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  campaign    PromoCampaign          @relation(fields: [campaignId], references: [id], onDelete: Restrict)
+
+  @@unique([userId, campaignId, runId])
+  @@unique([userId, idempotencyKey])
+  @@index([walletId, status, createdAt])
+  @@index([projectId, status, createdAt])
+  @@index([status, expiresAt])
+}
+
+model PromoEntitlementEvent {
+  id          String        @id @default(auto()) @map("_id") @db.ObjectId
+  walletId    String        @db.ObjectId
+  userId      String        @db.ObjectId
+  campaignId  String        @db.ObjectId
+  reservationId String?     @db.ObjectId
+  runId       String?
+  eventKey    String        @unique
+  type        PromoEventType
+  amount      Int
+  grantedAfter Int
+  reservedAfter Int
+  consumedAfter Int
+  reason      String?
+  createdAt   DateTime      @default(now())
+
+  wallet      PromoEntitlementWallet @relation(fields: [walletId], references: [id], onDelete: Restrict)
+  campaign    PromoCampaign          @relation(fields: [campaignId], references: [id], onDelete: Restrict)
+
+  @@index([userId, createdAt])
+  @@index([walletId, createdAt])
+  @@index([reservationId])
+}
+
+enum CreditQuoteStatus {
+  OPEN
+  USED
+  EXPIRED
+  CANCELLED
+}
+
+model CreditQuote {
+  id              String           @id @default(auto()) @map("_id") @db.ObjectId
+  userId          String           @db.ObjectId
+  projectId       String           @db.ObjectId
+  idempotencyKey  String
+  pricingVersion  String
+  estimatedCredits Int
+  breakdown       Json
+  status          CreditQuoteStatus @default(OPEN)
+  expiresAt       DateTime
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  user            User             @relation(fields: [userId], references: [id], onDelete: Restrict)
+  project         MovieProject     @relation(fields: [projectId], references: [id], onDelete: Restrict)
+
+  @@unique([userId, idempotencyKey])
+  @@index([userId, createdAt])
+  @@index([projectId, createdAt])
+  @@index([status, expiresAt])
+}
+
+// Versioned admin-managed pricing rules; snapshots on quotes, reservations and usage
+// preserve the exact rule applied to a run when the active configuration changes.
+model PricingRule {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  key         String
+  version     Int
+  enabled     Boolean  @default(false)
+  rules       Json
+  effectiveAt DateTime
+  expiresAt   DateTime?
+  updatedBy   String?  @db.ObjectId
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([key, version])
+  @@index([key, enabled, effectiveAt])
+}
+
+model CreditPackage {
+  id              String   @id @default(auto()) @map("_id") @db.ObjectId
+  key             String   @unique
+  name            String
+  credits         Int
+  bonusCredits    Int      @default(0)
+  amountMinor     BigInt
+  currency        String
+  enabled         Boolean  @default(false)
+  displayOrder    Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  paymentOrders   PaymentOrder[]
+
+  @@index([enabled, displayOrder])
+}
+
+enum PaymentOrderStatus {
+  CREATED
+  PENDING
+  PAID
+  FAILED
+  CANCELLED
+  PARTIALLY_REFUNDED
+  REFUNDED
+}
+
+enum PaymentProviderRecordType {
+  PAYMENT
+  REFUND
+}
+
+enum PaymentRecordStatus {
+  RECEIVED
+  VERIFIED
+  FAILED
+}
+
+model PaymentOrder {
+  id                  String            @id @default(auto()) @map("_id") @db.ObjectId
+  userId              String            @db.ObjectId
+  packageId           String?           @db.ObjectId
+  provider            String
+  idempotencyKey      String
+  status              PaymentOrderStatus @default(CREATED)
+  amountMinor         BigInt
+  currency            String
+  credits             Int
+  bonusCredits        Int               @default(0)
+  packageSnapshot     Json
+  providerReference   String?
+  paidAt              DateTime?
+  creditsGrantedAt    DateTime?
+  refundedMinor       BigInt            @default(0)
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+
+  user                User                  @relation(fields: [userId], references: [id], onDelete: Restrict)
+  package             CreditPackage?        @relation(fields: [packageId], references: [id], onDelete: Restrict)
+  providerTransactions PaymentProviderTransaction[]
+  webhookEvents       PaymentWebhookEvent[]
+  creditTransactions  CreditTransaction[]
+
+  @@unique([userId, idempotencyKey])
+  @@index([userId, createdAt])
+  @@index([userId, status, createdAt])
+  @@index([provider, providerReference])
+  @@index([status, createdAt])
+}
+
+// Provider transaction IDs are required and unique per provider; create this record only
+// once the provider supplies an ID, avoiding nullable unique-index pitfalls in MongoDB.
+model PaymentProviderTransaction {
+  id                    String                   @id @default(auto()) @map("_id") @db.ObjectId
+  paymentOrderId        String                   @db.ObjectId
+  provider              String
+  providerTransactionId String
+  type                  PaymentProviderRecordType
+  status                PaymentRecordStatus
+  amountMinor           BigInt
+  currency              String
+  verifiedAt            DateTime?
+  createdAt             DateTime                 @default(now())
+
+  paymentOrder PaymentOrder @relation(fields: [paymentOrderId], references: [id], onDelete: Restrict)
+
+  @@unique([provider, providerTransactionId])
+  @@index([paymentOrderId, createdAt])
+}
+
+model PaymentWebhookEvent {
+  id                  String              @id @default(auto()) @map("_id") @db.ObjectId
+  provider            String
+  providerEventId     String
+  paymentOrderId      String?             @db.ObjectId
+  eventType           String
+  status              PaymentRecordStatus @default(RECEIVED)
+  payloadHash         String?
+  signatureVerifiedAt DateTime?
+  processedAt         DateTime?
+  failureCode         String?
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+
+  paymentOrder PaymentOrder? @relation(fields: [paymentOrderId], references: [id], onDelete: Restrict)
+
+  @@unique([provider, providerEventId])
+  @@index([paymentOrderId, createdAt])
+  @@index([status, createdAt])
+}
+
+enum NotificationType {
+  PROCESSING
+  COMPLETED
+  FAILED
+  CREDIT
+  PAYMENT
+  REFUND
+  PROMOTION
+  ANNOUNCEMENT
+  SECURITY
+  SYSTEM
+}
+
+model Notification {
+  id          String           @id @default(auto()) @map("_id") @db.ObjectId
+  userId      String           @db.ObjectId
+  eventKey    String
+  type        NotificationType
+  title       String
+  body        String
+  data        Json?
+  readAt      DateTime?
+  createdAt   DateTime         @default(now())
+
+  user        User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, eventKey])
+  @@index([userId, readAt, createdAt])
+  @@index([createdAt])
+}
+
+model NotificationPreference {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId      String   @unique @db.ObjectId
+  preferences Json
+  updatedAt   DateTime @updatedAt
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model UserPreference {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId      String   @unique @db.ObjectId
+  preferences Json
+  updatedAt   DateTime @updatedAt
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+enum GalleryVisibility {
+  PRIVATE
+  PUBLIC
+  UNLISTED
+}
+
+enum GalleryEntryStatus {
+  READY
+  UNAVAILABLE
+  REMOVED
+}
+
+model GalleryEntry {
+  id            String             @id @default(auto()) @map("_id") @db.ObjectId
+  ownerId       String             @db.ObjectId
+  projectId     String             @db.ObjectId
+  videoRenderId String             @unique @db.ObjectId
+  title         String
+  thumbnailKey  String?
+  visibility    GalleryVisibility  @default(PRIVATE)
+  status        GalleryEntryStatus @default(READY)
+  publishedAt   DateTime?
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+
+  owner         User               @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  project       MovieProject       @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  videoRender   VideoRender        @relation(fields: [videoRenderId], references: [id], onDelete: Restrict)
+  shareLinks    VideoShareLink[]
+
+  @@index([ownerId, createdAt])
+  @@index([ownerId, status, createdAt])
+  @@index([projectId, createdAt])
+  @@index([visibility, status, createdAt])
+}
+
+enum ShareLinkStatus {
+  ACTIVE
+  REVOKED
+  DISABLED
+}
+
+model VideoShareLink {
+  id             String          @id @default(auto()) @map("_id") @db.ObjectId
+  galleryEntryId String          @db.ObjectId
+  ownerId        String          @db.ObjectId
+  tokenHash      String          @unique
+  status         ShareLinkStatus @default(ACTIVE)
+  expiresAt      DateTime?
+  passwordHash   String?
+  revokedAt      DateTime?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  galleryEntry GalleryEntry @relation(fields: [galleryEntryId], references: [id], onDelete: Restrict)
+
+  @@index([ownerId, createdAt])
+  @@index([galleryEntryId, status, createdAt])
+  @@index([status, expiresAt])
+}
+
+// Append-only record for privileged/admin changes. Keep secrets and raw payment payloads
+// out of metadata; record reason and redacted before/after values only.
+model AdminAuditLog {
+  id            String   @id @default(auto()) @map("_id") @db.ObjectId
+  actorId       String   @db.ObjectId
+  actorRole     String
+  action        String
+  targetType    String
+  targetId      String?
+  reason        String
+  requestId     String
+  before        Json?
+  after         Json?
+  metadata      Json?
+  createdAt     DateTime @default(now())
+
+  @@index([actorId, createdAt])
+  @@index([targetType, targetId, createdAt])
+  @@index([action, createdAt])
+  @@index([requestId])
+}
+
+enum JobEventType {
+  CREATED
+  QUEUED
+  STARTED
+  PROGRESS
+  RETRIED
+  CANCEL_REQUESTED
+  COMPLETED
+  FAILED
+}
+
+model JobEvent {
+  id           String       @id @default(auto()) @map("_id") @db.ObjectId
+  jobRecordId  String       @db.ObjectId
+  eventKey     String       @unique
+  type         JobEventType
+  fromStatus   JobStatus?
+  toStatus     JobStatus?
+  details      Json?
+  createdAt    DateTime     @default(now())
+
+  jobRecord    JobRecord    @relation(fields: [jobRecordId], references: [id], onDelete: Restrict)
+
+  @@index([jobRecordId, createdAt])
+  @@index([type, createdAt])
+}
+
+enum JobOutboxStatus {
+  PENDING
+  PUBLISHED
+  FAILED
+}
+
+model JobOutbox {
+  id             String          @id @default(auto()) @map("_id") @db.ObjectId
+  jobRecordId    String          @db.ObjectId
+  deliveryKey    String          @unique
+  queueName      String
+  payload        Json
+  status         JobOutboxStatus @default(PENDING)
+  attempts       Int             @default(0)
+  availableAt    DateTime        @default(now())
+  leaseExpiresAt DateTime?
+  publishedAt    DateTime?
+  lastErrorCode  String?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  jobRecord      JobRecord       @relation(fields: [jobRecordId], references: [id], onDelete: Restrict)
+
+  @@index([status, availableAt])
+  @@index([jobRecordId, createdAt])
+}

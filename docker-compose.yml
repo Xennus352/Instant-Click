@@ -1,0 +1,490 @@
+services:
+  # ============================================================
+  # REVERSE PROXY (NGINX)
+  # ============================================================
+  nginx:
+    image: nginx:alpine
+    container_name: instantcap-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+    depends_on:
+      - nextjs
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - instantcap-network
+    restart: unless-stopped
+
+  # ============================================================
+  # NEXT.JS APPLICATION (API + FRONTEND)
+  # ============================================================
+  nextjs:
+    build:
+      context: ./services/nextjs
+      dockerfile: Dockerfile.dev
+    container_name: instantcap-nextjs
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - NEXT_TELEMETRY_DISABLED=1
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
+      - S3_ENDPOINT=${S3_ENDPOINT}
+      - S3_PUBLIC_ENDPOINT=${S3_PUBLIC_ENDPOINT}
+      - S3_FORCE_PATH_STYLE=${S3_FORCE_PATH_STYLE:-true}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY}
+      - S3_SECRET_KEY=${S3_SECRET_KEY}
+      - S3_BUCKET=${S3_BUCKET}
+      - S3_REGION=${S3_REGION}
+      - S3_PUBLIC_HOSTNAME=${S3_PUBLIC_HOSTNAME}
+      - AUTH_SECRET=${AUTH_SECRET}
+      - APP_URL=${APP_URL:-http://localhost:3000}
+      - AUTH_GOOGLE_ID=${AUTH_GOOGLE_ID:-}
+      - AUTH_GOOGLE_SECRET=${AUTH_GOOGLE_SECRET:-}
+      - AUTH_GITHUB_ID=${AUTH_GITHUB_ID:-}
+      - AUTH_GITHUB_SECRET=${AUTH_GITHUB_SECRET:-}
+      - AUTH_EMAIL_FROM=${AUTH_EMAIL_FROM:-}
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY:-}
+      # DINGER callback system (empty defaults - payment gate false by default)
+      - DINGER_CALLBACKS_ENABLED=${DINGER_CALLBACKS_ENABLED:-false}
+      - DINGER_CALLBACK_KEY=${DINGER_CALLBACK_KEY:-}
+      - DINGER_API_KEY=${DINGER_API_KEY:-}
+      - DINGER_PUBLIC_KEY=${DINGER_PUBLIC_KEY:-}
+      - DINGER_PROJECT_KEY=${DINGER_PROJECT_KEY:-}
+      - DINGER_MERCHANT_KEY=${DINGER_MERCHANT_KEY:-}
+    volumes:
+      - ./services/nextjs:/app
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      mongodb-primary:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - instantcap-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  # ============================================================
+  # MONGODB REPLICA SET (3 NODES)
+  # ============================================================
+  mongodb-primary:
+    image: mongo:7
+    container_name: instantcap-mongodb-primary
+    command: >
+      mongod --replSet rs0 --bind_ip_all --port 27017
+      --wiredTigerCacheSizeGB 1
+      --oplogSize 128
+    environment:
+      - MONGO_INITDB_DATABASE=instantcap
+    volumes:
+      - mongodb_primary_data:/data/db
+      - mongodb_primary_config:/data/configdb
+    ports:
+      - "${MONGODB_HOST_PORT:-27018}:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - instantcap-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  mongodb-secondary:
+    image: mongo:7
+    container_name: instantcap-mongodb-secondary
+    command: >
+      mongod --replSet rs0 --bind_ip_all --port 27017
+      --wiredTigerCacheSizeGB 1
+    volumes:
+      - mongodb_secondary_data:/data/db
+      - mongodb_secondary_config:/data/configdb
+    depends_on:
+      mongodb-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - instantcap-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  mongodb-arbiter:
+    image: mongo:7
+    container_name: instantcap-mongodb-arbiter
+    command: mongod --replSet rs0 --bind_ip_all --port 27017 --oplogSize 1
+    volumes:
+      - mongodb_arbiter_data:/data/db
+    depends_on:
+      mongodb-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - instantcap-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
+  # Replica set initializer (runs once)
+  mongodb-init:
+    image: mongo:7
+    container_name: instantcap-mongodb-init
+    environment:
+      - MONGO_PRIMARY_HOST=mongodb-primary:27017
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_INITDB_ROOT_USERNAME:-admin}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_INITDB_ROOT_PASSWORD:-password}
+    volumes:
+      - ./scripts/mongodb-init.sh:/scripts/mongodb-init.sh:ro
+    depends_on:
+      mongodb-primary:
+        condition: service_healthy
+      mongodb-secondary:
+        condition: service_healthy
+      mongodb-arbiter:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/scripts/mongodb-init.sh"]
+    networks:
+      - instantcap-network
+    restart: "no"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+  # ============================================================
+  # REDIS (SINGLE NODE FOR DEV)
+  # ============================================================
+  redis:
+    image: redis:7-alpine
+    container_name: instantcap-redis
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction
+    volumes:
+      - redis_data:/data
+    ports:
+      # Keep the container port unchanged; 6379 is already used by local Redis on this host.
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - instantcap-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # ============================================================
+  # S3-COMPATIBLE OBJECT STORAGE
+  # ============================================================
+  minio:
+    image: dappros/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: instantcap-minio
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=${S3_ACCESS_KEY:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${S3_SECRET_KEY:-minioadmin}
+      - MINIO_API_CORS_ALLOW_ORIGIN=http://localhost:3000
+    volumes:
+      - minio_data:/data
+    ports:
+      - "19002:9000"
+      - "19003:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - instantcap-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # S3 bucket initialization. Direct-upload CORS is configured on the MinIO server above.
+  minio-init:
+    image: amazon/aws-cli:latest
+    container_name: instantcap-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      - AWS_ACCESS_KEY_ID=${S3_ACCESS_KEY:-minioadmin}
+      - AWS_SECRET_ACCESS_KEY=${S3_SECRET_KEY:-minioadmin}
+      - AWS_DEFAULT_REGION=us-east-1
+    entrypoint: >
+      /bin/sh -c "
+        sleep 5 &&
+        # Create all buckets idempotently (skip if already exists)
+        for b in instantcap instantcap-uploads instantcap-audio instantcap-transcripts instantcap-scripts instantcap-narration instantcap-subtitles instantcap-renders instantcap-thumbnails instantcap-temp; do
+          if ! aws --endpoint-url=http://minio:9000 s3api head-bucket --bucket $$b 2>/dev/null; then
+            aws --endpoint-url=http://minio:9000 s3 mb s3://$$b
+          else
+            echo \"Bucket $$b already exists, skipping\"
+          fi
+        done &&
+        # NOTE: this MinIO image does not support PutBucketCors; browser CORS is configured by MINIO_API_CORS_ALLOW_ORIGIN.
+        echo 'Buckets created/verified successfully.'
+      "
+    networks:
+      - instantcap-network
+    restart: "no"
+
+  # ============================================================
+  # AI WORKERS (PLACEHOLDERS - MILESTONE 5+)
+  # ============================================================
+  asr-worker:
+    build:
+      context: ./services/asr-worker
+      dockerfile: Dockerfile.dev
+    container_name: instantcap-asr-worker
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      - MODEL_PATH=/models/nara-sar/onnx/acoustic.onnx
+      - LM_PATH=/models/nara-sar/language.lm
+      - DECODER_CONFIG=/models/nara-sar/sar.json
+      - ORT_THREADS=2
+      - ORT_PROVIDERS=CPUExecutionProvider
+      - WORKER_PORT=8001
+      - S3_ENDPOINT=${S3_ENDPOINT}
+      - S3_PUBLIC_ENDPOINT=${S3_PUBLIC_ENDPOINT}
+      - S3_FORCE_PATH_STYLE=${S3_FORCE_PATH_STYLE:-true}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY:-minioadmin}
+      - S3_SECRET_KEY=${S3_SECRET_KEY:-minioadmin}
+      - S3_BUCKET=instantcap
+      - S3_REGION=us-east-1
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY:-}
+    volumes:
+      - model_cache:/models:ro
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8001/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - instantcap-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 3G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  tts-worker:
+    build:
+      context: ./services/tts-worker
+      dockerfile: Dockerfile.dev
+    container_name: instantcap-tts-worker
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      - MODEL_DIR=/models/nara-mini-v1
+      - VOICES=shoon,thazin,ko-banyar,htet-myat
+      - ORT_THREADS=2
+      - ORT_PROVIDERS=CPUExecutionProvider
+      - WORKER_PORT=8002
+      - S3_ENDPOINT=${S3_ENDPOINT}
+      - S3_PUBLIC_ENDPOINT=${S3_PUBLIC_ENDPOINT}
+      - S3_FORCE_PATH_STYLE=${S3_FORCE_PATH_STYLE:-true}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY:-minioadmin}
+      - S3_SECRET_KEY=${S3_SECRET_KEY:-minioadmin}
+      - S3_BUCKET=instantcap
+      - S3_REGION=us-east-1
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY:-}
+    volumes:
+      - model_cache:/models:ro
+    ports:
+      - "8002:8002"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8002/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - instantcap-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 3G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  ai-worker:
+    build:
+      context: ./services/ai-worker
+      dockerfile: Dockerfile.dev
+    container_name: instantcap-ai-worker
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.8-flash}
+      - WORKER_PORT=8003
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY:-}
+    ports:
+      - "8003:8003"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8003/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - instantcap-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  render-worker:
+    build:
+      context: ./services/render-worker
+      dockerfile: Dockerfile.dev
+    container_name: instantcap-render-worker
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      - FFMPEG_THREADS=2
+      - WORKER_PORT=8004
+      - S3_ENDPOINT=${S3_ENDPOINT}
+      - S3_PUBLIC_ENDPOINT=${S3_PUBLIC_ENDPOINT}
+      - S3_FORCE_PATH_STYLE=${S3_FORCE_PATH_STYLE:-true}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY:-minioadmin}
+      - S3_SECRET_KEY=${S3_SECRET_KEY:-minioadmin}
+      - S3_BUCKET=instantcap
+      - S3_REGION=us-east-1
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY:-}
+    ports:
+      - "8004:8004"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8004/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - instantcap-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+        reservations:
+          cpus: '2'
+          memory: 2G
+
+networks:
+  instantcap-network:
+    driver: bridge
+    name: instantcap-network
+
+volumes:
+  mongodb_primary_data:
+  mongodb_primary_config:
+  mongodb_secondary_data:
+  mongodb_secondary_config:
+  mongodb_arbiter_data:
+  redis_data:
+  minio_data:
+  model_cache:
